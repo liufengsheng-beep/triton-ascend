@@ -57,6 +57,7 @@ from triton.backends.ascend.utils import (
     force_disable_ffts,
     triton_enable_libdevice_simt,
     get_cann_version_file_hash,
+    is_cann_version_at_least,
 )
 from triton.backends.ascend.driver import (
     NPUUtils
@@ -501,6 +502,8 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             f"--enable-auto-bind-sub-block={get_auto_bind_sub_block_option(metadata)}",
         ]
 
+        _compile_option_list += [f"--enable-optimized-metaop={is_cann_version_at_least(9, 2, 0)}"]
+
         if force_disable_ffts():
             _compile_option_list += ["--disable-ffts"]
         if _is_ascend_sanitizer_enabled():
@@ -759,6 +762,8 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         _compile_option_list += [
             f"--enable-auto-bind-sub-block={get_auto_bind_sub_block_option(metadata)}",
         ]
+
+        _compile_option_list += [f"--enable-optimized-metaop=false"]
 
         if _is_ascend_sanitizer_enabled():
             _compile_option_list += ["--enable-sanitizer=true"]
