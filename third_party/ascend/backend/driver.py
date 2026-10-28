@@ -1005,7 +1005,7 @@ void triton_launch_kernel(
   uint32_t blockNum4Workspace = gridX * gridY * gridZ;
   {get_backend_func("pre_launch", True)}
   {f'''
-  uint64_t totalWorkSpaceSize = {workspace_size} * blockNum4Workspace;
+  uint64_t totalWorkSpaceSize = (uint64_t){workspace_size} * blockNum4Workspace;
   {get_backend_func("allocate_memory", "totalWorkSpaceSize", "stream")}
   std::shared_ptr<void> workspace_handle_guard(workspace_handle, release_npu_tensor_handle);
   if (!workspace_addr_ptr) {{
@@ -1110,7 +1110,7 @@ static void _launch(const char* kernelName, cann_func_handle func, cann_stream s
   uint32_t blockNum4Workspace = gridX * gridY * gridZ;
   {get_backend_func("pre_launch", True)}
   {f'''
-  uint64_t totalWorkSpaceSize = {workspace_size} * blockNum4Workspace;
+  uint64_t totalWorkSpaceSize = (uint64_t){workspace_size} * blockNum4Workspace;
   {get_backend_func("allocate_memory", "totalWorkSpaceSize", "stream")}
   std::shared_ptr<void> workspace_handle_guard(workspace_handle, release_npu_tensor_handle);
   if (!workspace_addr_ptr) {{
