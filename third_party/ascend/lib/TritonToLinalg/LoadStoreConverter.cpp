@@ -1091,80 +1091,31 @@ AtomicCASConverter::matchAndRewrite(triton::AtomicCASOp op, OpAdaptor adaptor,
     indexingMaps.push_back(AffineMap::get(rank, 0, inputDims, context));
   }
 
-  if (!op.getResult().use_empty()) {
-    auto tensorType =
-        RankedTensorType::get(type.getShape(), type.getElementType());
-    auto alloc = rewriter.create<memref::AllocOp>(
-        loc, MemRefType::get(type.getShape(), type.getElementType()));
+  bool hasUsedReturn = !op.getResult().use_empty();
 
-    // For the return value, don't need to care about mask for now
-    // this op don't support other, so we best not fill it
-    rewriter.create<memref::CopyOp>(loc, ptr, alloc);
-    Value tensor = rewriter.create<bufferization::ToTensorOp>(
-        loc, tensorType, alloc, true /* restrict */, true /* writable */);
-    rewriter.replaceOp(op, tensor);
-  }
+  // Build the hfusion::AtomicCasOp directly.  This skips the fragile
+  // linalg.generic intermediate form entirely — bisheng's LinalgToHFusion
+  // only supports returning the old value on reg-based arch, and even then
+  // it replaces the old-value buffer (a memref.alloc) with a tensor-typed
+  // hfusion result, which trips the downstream memref/tensor verifiers.
+  // By creating hfusion::AtomicCasOp here we get a single clean atomic op
+  // that bisheng lowers to hivm::AtomicCasOp and finally to a hardware CAS
+  // instruction that atomically performs compare+conditional store AND
+  // returns the old value — zero TOCTOU window, zero locks needed.
+  auto tensorType =
+      RankedTensorType::get(type.getShape(), type.getElementType());
 
-  auto linalgOp = rewriter.create<linalg::GenericOp>(
-      loc, ValueRange{dstMemref, cmpMemref, inputMemref},
-      mlir::ValueRange{dstMemref}, indexingMaps,
-      mlir::ConverterUtils::getNParallelLoopsAttrs(rank),
-      [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange blockArgs) {
-        Value lhs = blockArgs[0];
-        Value rhs = blockArgs[1];
-        Value setValue = blockArgs[2];
-        Value cond;
-        if (mlir::isa<mlir::FloatType>(lhs.getType())) {
-          cond = nestedBuilder.create<arith::CmpFOp>(
-              nestedLoc, arith::CmpFPredicate::UEQ, lhs, rhs);
-        } else {
-          cond = nestedBuilder.create<arith::CmpIOp>(
-              nestedLoc, arith::CmpIPredicate::eq, lhs, rhs);
-        }
-        auto ifOp = nestedBuilder.create<scf::IfOp>(
-            nestedLoc, TypeRange{setValue.getType()}, cond, true);
-        {
-          OpBuilder::InsertionGuard guard(nestedBuilder);
-          nestedBuilder.setInsertionPointToEnd(&ifOp.getThenRegion().front());
-          nestedBuilder.create<scf::YieldOp>(nestedLoc, setValue);
-        }
-        {
-          OpBuilder::InsertionGuard guard(nestedBuilder);
-          nestedBuilder.setInsertionPointToEnd(&ifOp.getElseRegion().front());
-          nestedBuilder.create<scf::YieldOp>(nestedLoc, lhs);
-        }
-        nestedBuilder.setInsertionPointToEnd(nestedBuilder.getBlock());
-        nestedBuilder.create<mlir::linalg::YieldOp>(nestedLoc,
-                                                    ifOp.getResult(0));
-      });
-
-  const StringRef genericAtomicRMW = "GenericAtomicRMW";
-  const StringRef memSemantic = "MemSemantic";
-  const StringRef memSyncScope = "MemSyncScope";
-  auto attr = mlir::StringAttr::get(context, "cas");
-
-  linalgOp->setAttr(genericAtomicRMW, attr);
-  linalgOp->setAttr(memSemantic,
-                    rewriter.getStringAttr(stringifyEnum(op.getSem())));
-  linalgOp->setAttr(memSyncScope,
-                    rewriter.getStringAttr(stringifyEnum(op.getScope())));
-
-  linalgOp->setAttr("Software", rewriter.getUnitAttr());
-
-  // tt.atomicRMW op has two part of feature
-  // 1. load the old data at the ptr
-  // 2. atomically store the data on ub to the ptr
-  //    at the same time it perform the action it has been assigned
-  // So we lower this op to load + atomically store
-  //
-  // The first part is not necessary when the returned value of atomic op
-  // is not used, it will be deleted cause it's meaningless
-  // Here, we preemptively determine whether it will be used
-  // and decide whether it is necessary to create the load process based on
-  // this assessment.
-  //
-  // logic of handling is copied
-  if (op.getResult().use_empty()) {
+  hfusion::AtomicCasOp casOp;
+  if (hasUsedReturn) {
+    casOp = rewriter.create<hfusion::AtomicCasOp>(
+        loc, TypeRange{tensorType},
+        ValueRange{cmpMemref, inputMemref}, dstMemref);
+    // The tensor result of hfusion::AtomicCasOp IS the old value observed by
+    // hardware — replace tt.atomic_cas with it directly.
+    rewriter.replaceOp(op, casOp.getResult());
+  } else {
+    casOp = rewriter.create<hfusion::AtomicCasOp>(
+        loc, TypeRange{}, ValueRange{cmpMemref, inputMemref}, dstMemref);
     rewriter.eraseOp(op);
   }
   return success();
