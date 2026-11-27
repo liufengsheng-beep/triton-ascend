@@ -710,11 +710,14 @@ def _dot_operand_is_fractal(name, fmt):
 
 
 @builtin
-def dot(a: tl.tensor, b: tl.tensor, format_a="", format_b="", format_c="", _semantic=None) -> tl.tensor:
+def dot(a: tl.tensor, b: tl.tensor, c: tl.tensor = None, format_a="", format_b="", format_c="", format_d="",
+        _semantic=None) -> tl.tensor:
     """
-    Matrix multiply ``D = A * B`` with per-operand layout format.
+    Matrix multiply ``D = A * B`` with an optional accumulator ``D = A * B + C``,
+    each operand carrying its own layout format.
 
-    ``format_a`` / ``format_b`` / ``format_c`` select each operand's layout:
+    ``format_a`` / ``format_b`` / ``format_c`` / ``format_d`` select each
+    operand's layout:
       - ``"fractal"``: zN fractal (4D)
       - ``"nd"`` / ``""`` / unset: ND (non-fractal, 2D)
       - any other value raises ``ValueError``.
@@ -723,19 +726,27 @@ def dot(a: tl.tensor, b: tl.tensor, format_a="", format_b="", format_c="", _sema
         A [M,K] <-> [K1, M1, 16, b]      (ND = [d1*d2, d0*d3])
         B [K,N] <-> [N1, K1, 16, b]      (ND = [d1*d2, d0*d3])
         C [M,N] <-> [N1, M1, 16, 16]     (L0C accumulator, block 16x16)
+        D [M,N] <-> [N1, M1, 16, 16]     (L0C accumulator, block 16x16)
 
     :param a: left matrix A (2D ND, or 4D fractal when ``format_a="fractal"``).
     :param b: right matrix B (2D ND, or 4D fractal when ``format_b="fractal"``).
+    :param c: optional accumulator C, added to ``A * B``. Its shape must match D.
     :param format_a: layout of A: "fractal" | "nd" | "" (default ND).
     :param format_b: layout of B: "fractal" | "nd" | "" (default ND).
-    :param format_c: layout of D: "fractal" | "nd" | "" (default ND).
+    :param format_c: layout of C: "fractal" | "nd" | "" (default ND).
+    :param format_d: layout of D: "fractal" | "nd" | "" (default: same as ``format_c``,
+        which keeps the pre-accumulator meaning of ``format_c`` as D's layout).
 
-    :return: D = A * B (fractal 4D if ``format_c="fractal"`` else 2D ND).
+    :return: D = A * B (+ C) (fractal 4D if ``format_d="fractal"`` else 2D ND).
     :rtype: tensor
     """
     fractal_a = _dot_operand_is_fractal("a", format_a)
     fractal_b = _dot_operand_is_fractal("b", format_b)
     fractal_c = _dot_operand_is_fractal("c", format_c)
+    # format_d describes D; fall back to format_c so callers written before the
+    # accumulator existed, which used format_c for D's layout, keep working.
+    fractal_d = _dot_operand_is_fractal("d", format_d) if _unwrap_if_constexpr(format_d) not in (None, "") \
+        else fractal_c
 
     for name, operand, is_frac, is_lhs in (("a", a, fractal_a, True), ("b", b, fractal_b, False)):
         if not isinstance(operand, tl.tensor):
@@ -755,10 +766,28 @@ def dot(a: tl.tensor, b: tl.tensor, format_a="", format_b="", format_c="", _sema
     b_nd = _dot_to_nd_shape([_unwrap_if_constexpr(s) for s in b.shape], fractal_b, False)
     m, n = a_nd[0], b_nd[1]
     # The result carries the cube accumulator dtype (f32/i32, see semantic.dot);
-    # fractal_c is the L0C accumulator fractal, whose block is 16x16.
-    output_shape = [n // 16, m // 16, 16, 16] if fractal_c else [m, n]
+    # fractal_d is the L0C accumulator fractal, whose block is 16x16.
+    output_shape = [n // 16, m // 16, 16, 16] if fractal_d else [m, n]
 
-    return semantic.dot(a, b, fractal_a, fractal_b, fractal_c, output_shape, _semantic=_semantic)
+    d = semantic.dot(a, b, fractal_a, fractal_b, fractal_d, output_shape, _semantic=_semantic)
+    if c is None:
+        return d
+
+    if not isinstance(c, tl.tensor):
+        raise TypeError(f"dot accumulator `c` must be a tensor, got {type(c)}")
+    c_shape = [_unwrap_if_constexpr(s) for s in c.shape]
+    if c_shape != output_shape:
+        raise ValueError(f"dot accumulator `c` shape {c_shape} does not match D {output_shape}; "
+                         f"format_c ({_unwrap_if_constexpr(format_c)!r}) describes C and format_d "
+                         f"({_unwrap_if_constexpr(format_d)!r}) describes D, both must agree")
+    acc_dtype = tl.float32 if a.dtype.is_floating() else tl.int32
+    if c.dtype != acc_dtype:
+        raise TypeError(f"dot accumulator `c` must be {acc_dtype}, got {c.dtype}")
+
+    # Inside a ``@builtin`` the ``+`` operator is unavailable: ``Tensor.__add__``
+    # is itself a builtin and needs the ``_semantic`` handle, so go through
+    # ``tl.add`` explicitly.
+    return tl.add(d, c, _semantic=_semantic)
 
 
 @builtin
